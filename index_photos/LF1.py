@@ -1,34 +1,58 @@
 import os
 import json
 import logging
-from datetime import datetime
+import urllib.parse
+import urllib3
+from datetime import datetime, timezone
+from botocore.session import Session
+from botocore.awsrequest import AWSRequest
+from botocore.auth import SigV4Auth
 import boto3
-import requests
-from requests_aws4auth import AWS4Auth
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 # Environment variables with defaults
 REKOGNITION_MIN_CONF = float(os.environ.get("REKOGNITION_MIN_CONF", "70.0"))  # percent
-OPENSEARCH_HOST = os.environ.get("OPENSEARCH_HOST")  # e.g. https://search-photos-abc123.us-east-1.es.amazonaws.com
-OPENSEARCH_INDEX = os.environ.get("OPENSEARCH_INDEX", "photos")
+OS_ENDPOINT = os.environ.get("OS_ENDPOINT", "").rstrip("/")  # e.g. https://search-photos-abc123.us-east-1.es.amazonaws.com
+OS_INDEX = os.environ.get("OS_INDEX", "photos")
 REGION = os.environ.get("AWS_REGION", "us-east-1")
+
+# Validate required environment variables
+if not OS_ENDPOINT:
+    raise ValueError("OS_ENDPOINT environment variable is required")
 
 # Initialize AWS clients
 s3 = boto3.client("s3")
 rek = boto3.client("rekognition")
 
-# Initialize AWS4Auth for ElasticSearch requests (created once at module level)
-session = boto3.session.Session()
-credentials = session.get_credentials().get_frozen_credentials()
-awsauth = AWS4Auth(
-    credentials.access_key,
-    credentials.secret_key,
-    REGION,
-    "es",
-    session_token=credentials.token
-)
+# Initialize HTTP client and credentials for OpenSearch
+http = urllib3.PoolManager()
+credentials = Session().get_credentials().get_frozen_credentials()
+
+
+def os_signed_request(method, path, body=None, params=None):
+    """Send a SigV4-signed HTTP request to OpenSearch."""
+    if params:
+        qs = urllib.parse.urlencode(params)
+        url = f"{OS_ENDPOINT}{path}?{qs}"
+    else:
+        url = f"{OS_ENDPOINT}{path}"
+
+    headers = {
+        "Host": urllib.parse.urlparse(OS_ENDPOINT).netloc,
+        "Content-Type": "application/json"
+    }
+
+    data = body if isinstance(body, (str, bytes)) else (json.dumps(body) if body else None)
+
+    req = AWSRequest(method=method, url=url, data=data, headers=headers)
+    SigV4Auth(credentials, "es", REGION).add_auth(req)
+
+    resp = http.request(method, url, body=data, headers=dict(req.headers))
+    if resp.status not in (200, 201):
+        raise RuntimeError(f"OpenSearch {resp.status}: {resp.data.decode('utf-8','ignore')}")
+    return json.loads(resp.data)
 
 
 def get_custom_labels(bucket, key):
@@ -90,13 +114,10 @@ def index_document(doc_id, body):
     """
     Index the document in ElasticSearch.
     """
-    url = f"{OPENSEARCH_HOST}/{OPENSEARCH_INDEX}/_doc/{doc_id}"
-    headers = {"Content-Type": "application/json"}
-    r = requests.put(url, auth=awsauth, headers=headers, data=json.dumps(body))
-    if r.status_code not in (200, 201):
-        logger.error("Failed to index doc: status=%s resp=%s", r.status_code, r.text)
-        raise Exception(f"Index error: {r.status_code} {r.text}")
-    return r.json()
+    path = f"/{OS_INDEX}/_doc/{doc_id}"
+    res = os_signed_request("PUT", path, body=body)
+    logger.info("Document indexed successfully: %s", doc_id)
+    return res
 
 
 def lambda_handler(event, context):
@@ -107,8 +128,8 @@ def lambda_handler(event, context):
     logger.info("Received event: %s", json.dumps(event))
     
     # Validate environment variables
-    if not OPENSEARCH_HOST:
-        logger.error("OPENSEARCH_HOST environment variable not set")
+    if not OS_ENDPOINT:
+        logger.error("OS_ENDPOINT environment variable not set")
         return {
             'statusCode': 500,
             'body': json.dumps('ElasticSearch host not configured')
@@ -122,7 +143,7 @@ def lambda_handler(event, context):
             key = s3rec["object"]["key"]
             
             # Key may be URL-encoded in event, decode if necessary
-            key = requests.utils.unquote(key)
+            key = urllib.parse.unquote(key)
             
             logger.info("Processing s3://%s/%s", bucket, key)
             
@@ -134,9 +155,10 @@ def lambda_handler(event, context):
             
             # Merge and normalize all labels
             merged = normalize_labels(custom_labels + rek_labels)
+            logger.info("Merged labels: %s", merged)
             
             # Get timestamp (ISO8601 UTC format)
-            timestamp = datetime.utcnow().isoformat() + "Z"
+            timestamp = datetime.now(timezone.utc).isoformat(timespec='seconds') + "Z"
             
             # Create document for ElasticSearch
             doc = {
