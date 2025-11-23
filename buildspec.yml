@@ -1,0 +1,23 @@
+version: 0.2
+
+phases:
+  build:
+    commands:
+      # Build LF1 (index-photos)
+      - echo Building index-photos Lambda...
+      - cd index_photos
+      - pip install -r requirements.txt -t .
+      - zip -r ../index-photos-deployment.zip . -x "*.pyc" "__pycache__/*" "*.git*"
+      - cd ..
+      
+      # Build LF2 (search-photos)
+      - echo Building search-photos Lambda...
+      - cd search_photos
+      - pip install -r requirements.txt -t .
+      - zip -r ../search-photos-deployment.zip . -x "*.pyc" "__pycache__/*" "*.git*"
+      - cd ..
+
+artifacts:
+  files:
+    - index-photos-deployment.zip
+    - search-photos-deployment.zip
