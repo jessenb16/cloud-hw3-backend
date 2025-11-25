@@ -33,26 +33,41 @@ credentials = Session().get_credentials().get_frozen_credentials()
 
 def os_signed_request(method, path, body=None, params=None):
     """Send a SigV4-signed HTTP request to OpenSearch."""
-    if params:
-        qs = urllib.parse.urlencode(params)
-        url = f"{OS_ENDPOINT}{path}?{qs}"
-    else:
-        url = f"{OS_ENDPOINT}{path}"
+    try:
+        if params:
+            qs = urllib.parse.urlencode(params)
+            url = f"{OS_ENDPOINT}{path}?{qs}"
+        else:
+            url = f"{OS_ENDPOINT}{path}"
 
-    headers = {
-        "Host": urllib.parse.urlparse(OS_ENDPOINT).netloc,
-        "Content-Type": "application/json"
-    }
+        logger.info("OpenSearch request: %s %s", method, url)
 
-    data = body if isinstance(body, (str, bytes)) else (json.dumps(body) if body else None)
+        headers = {
+            "Host": urllib.parse.urlparse(OS_ENDPOINT).netloc,
+            "Content-Type": "application/json"
+        }
 
-    req = AWSRequest(method=method, url=url, data=data, headers=headers)
-    SigV4Auth(credentials, "es", REGION).add_auth(req)
+        data = body if isinstance(body, (str, bytes)) else (json.dumps(body) if body else None)
+        logger.info("Request body: %s", data[:500] if data and len(str(data)) > 500 else data)
 
-    resp = http.request(method, url, body=data, headers=dict(req.headers))
-    if resp.status not in (200, 201):
-        raise RuntimeError(f"OpenSearch {resp.status}: {resp.data.decode('utf-8','ignore')}")
-    return json.loads(resp.data)
+        req = AWSRequest(method=method, url=url, data=data, headers=headers)
+        SigV4Auth(credentials, "es", REGION).add_auth(req)
+
+        logger.info("Sending request to OpenSearch...")
+        resp = http.request(method, url, body=data, headers=dict(req.headers))
+        logger.info("OpenSearch response status: %s", resp.status)
+        
+        if resp.status not in (200, 201):
+            error_msg = resp.data.decode('utf-8', 'ignore')
+            logger.error("OpenSearch error response: %s", error_msg)
+            raise RuntimeError(f"OpenSearch {resp.status}: {error_msg}")
+        
+        result = json.loads(resp.data)
+        logger.info("OpenSearch request successful")
+        return result
+    except Exception as e:
+        logger.error("os_signed_request failed: %s", str(e), exc_info=True)
+        raise
 
 
 def get_custom_labels(bucket, key):
@@ -114,10 +129,24 @@ def index_document(doc_id, body):
     """
     Index the document in ElasticSearch.
     """
-    path = f"/{OS_INDEX}/_doc/{doc_id}"
-    res = os_signed_request("PUT", path, body=body)
-    logger.info("Document indexed successfully: %s", doc_id)
-    return res
+    try:
+        logger.info("Attempting to index document: %s", doc_id)
+        logger.info("Document body: %s", json.dumps(body))
+        logger.info("OpenSearch endpoint: %s", OS_ENDPOINT)
+        logger.info("OpenSearch index: %s", OS_INDEX)
+        
+        # URL-encode the doc_id to handle special characters properly
+        encoded_doc_id = urllib.parse.quote(doc_id, safe='')
+        path = f"/{OS_INDEX}/_doc/{encoded_doc_id}"
+        logger.info("Full path: %s", path)
+        
+        res = os_signed_request("PUT", path, body=body)
+        logger.info("Document indexed successfully: %s", doc_id)
+        logger.info("OpenSearch response: %s", json.dumps(res))
+        return res
+    except Exception as e:
+        logger.error("Failed to index document %s: %s", doc_id, str(e), exc_info=True)
+        raise  # Re-raise so outer handler can catch it
 
 
 def lambda_handler(event, context):
@@ -142,16 +171,17 @@ def lambda_handler(event, context):
             bucket = s3rec["bucket"]["name"]
             key = s3rec["object"]["key"]
             
-            # Key may be URL-encoded in event, decode if necessary
-            key = urllib.parse.unquote(key)
+            # S3 event keys are URL-encoded. Decode to get the actual object key.
+            # Use unquote_plus to handle both % encoding and + as space.
+            decoded_key = urllib.parse.unquote_plus(key, encoding='utf-8')
             
-            logger.info("Processing s3://%s/%s", bucket, key)
+            logger.info("Raw S3 event key: %s", key)
+            logger.info("Decoded key for S3 operations: %s", decoded_key)
+            logger.info("Processing s3://%s/%s", bucket, decoded_key)
             
-            # Get Rekognition labels
-            rek_labels = get_rekognition_labels(bucket, key)
-            
-            # Get custom labels from S3 metadata
-            custom_labels = get_custom_labels(bucket, key)
+            # Use decoded_key for all S3 operations
+            rek_labels = get_rekognition_labels(bucket, decoded_key)
+            custom_labels = get_custom_labels(bucket, decoded_key)
             
             # Merge and normalize all labels
             merged = normalize_labels(custom_labels + rek_labels)
@@ -162,14 +192,14 @@ def lambda_handler(event, context):
             
             # Create document for ElasticSearch
             doc = {
-                "objectKey": key,
+                "objectKey": decoded_key,  # Store the decoded key
                 "bucket": bucket,
                 "createdTimestamp": timestamp,
                 "labels": merged
             }
             
-            # Use object key as doc id (URL-safe). Replace / with _ for valid doc IDs
-            doc_id = key.replace("/", "_")
+            # Use decoded key as doc id (URL-safe). Replace / with _ for valid doc IDs
+            doc_id = decoded_key.replace("/", "_")
             
             # Index the document
             res = index_document(doc_id, doc)

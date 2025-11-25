@@ -29,6 +29,7 @@ if not LEX_BOT_ALIAS_ID:
 
 # AWS clients
 lex = boto3.client("lexv2-runtime", region_name=REGION)
+s3 = boto3.client("s3", region_name=REGION) 
 http = urllib3.PoolManager()
 credentials = Session().get_credentials().get_frozen_credentials()
 
@@ -123,7 +124,7 @@ def search_photos_in_os(keywords, size=20):
         "query": {
             "bool": {
                 "should": [{"match": {"labels": kw}} for kw in keywords],
-                "minimum_should_match": 1  # At least one keyword must match
+                "minimum_should_match": 1
             }
         }
     }
@@ -131,16 +132,30 @@ def search_photos_in_os(keywords, size=20):
     try:
         res = os_signed_request("POST", f"/{OS_INDEX}/_search", body=query)
         hits = res.get("hits", {}).get("hits", [])
-        results = [
-            {"objectKey": h["_source"]["objectKey"], "bucket": h["_source"]["bucket"]}
-            for h in hits
-        ]
+        results = []
+        for h in hits:
+            source = h["_source"]
+            bucket = source["bucket"]
+            object_key = source["objectKey"]
+            labels = source.get("labels", [])  # Extract labels
+            
+            # Generate presigned URL (or use public URL if bucket is public)
+            photo_url = s3.generate_presigned_url(
+                'get_object',
+                Params={'Bucket': bucket, 'Key': object_key},
+                ExpiresIn=3600
+            )
+            
+            results.append({
+                "url": photo_url,
+                "labels": labels
+            })
+        
         logger.info("OpenSearch returned %d hits", len(results))
         return results
     except Exception as e:
         logger.error("OpenSearch search failed: %s", e, exc_info=True)
         return []
-
 
 def lambda_handler(event, context):
     """Lambda handler for /search?q=<query> requests."""
@@ -188,7 +203,7 @@ def lambda_handler(event, context):
                 "Content-Type": "application/json",
                 "Access-Control-Allow-Origin": "*"
             },
-            "body": json.dumps(results)
+            "body": json.dumps({"results": results})  # Wrap in "results" object
         }
         
     except Exception as e:
@@ -199,5 +214,5 @@ def lambda_handler(event, context):
                 "Content-Type": "application/json",
                 "Access-Control-Allow-Origin": "*"
             },
-            "body": json.dumps({"error": "Internal server error"})
+            "body": json.dumps({"results": []})
         }
