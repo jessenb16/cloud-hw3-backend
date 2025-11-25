@@ -12,24 +12,22 @@ phases:
       # Package index-photos Lambda
       - cd index_photos
       - cp LF1.py lambda_function.py
-      - pip install -r requirements.txt -t .
-      - zip -r ../index-photos.zip . -x "*.pyc" "__pycache__/*" "*.txt"
+      - zip -r ../index-photos.zip lambda_function.py
       - rm lambda_function.py
       - cd ..
       
       # Package search-photos Lambda
       - cd search_photos
       - cp LF2.py lambda_function.py
-      - pip install -r requirements.txt -t .
-      - zip -r ../search-photos.zip . -x "*.pyc" "__pycache__/*" "*.txt"
+      - zip -r ../search-photos.zip lambda_function.py
       - rm lambda_function.py
       - cd ..
       
   post_build:
     commands:
       - echo "Deploying to Lambda functions"
-      - aws lambda update-function-code --function-name index-photos-cloudformation --zip-file fileb://index-photos.zip
-      - aws lambda update-function-code --function-name search-photos-cloudformation --zip-file fileb://search-photos.zip
+      - aws lambda update-function-code --function-name LF1 --zip-file fileb://index-photos.zip
+      - aws lambda update-function-code --function-name LF2 --zip-file fileb://search-photos.zip
 artifacts:
   files:
     - index-photos.zip
