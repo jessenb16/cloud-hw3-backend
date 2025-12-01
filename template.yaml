@@ -628,7 +628,7 @@ Resources:
       RestApiId: !Ref APIGateway
       ResourceId: !Ref APIGatewaySearchResource
       HttpMethod: GET
-      AuthorizationType: API_KEY
+      AuthorizationType: NONE
       ApiKeyRequired: true
       MethodResponses:
         - StatusCode: '200'
@@ -683,7 +683,7 @@ Resources:
       RestApiId: !Ref APIGateway
       ResourceId: !Ref APIGatewayIndexResource
       HttpMethod: PUT
-      AuthorizationType: API_KEY
+      AuthorizationType: NONE
       ApiKeyRequired: true
       RequestParameters:
         method.request.querystring.objectKey: true
@@ -754,11 +754,12 @@ Resources:
 
   APIGatewayUsagePlan:
     Type: AWS::ApiGateway::UsagePlan
+    DependsOn: APIGatewayStage
     Properties:
       UsagePlanName: APIUsagePlan
       ApiStages:
         - ApiId: !Ref APIGateway
-          Stage: !GetAtt APIGatewayStage.StageName
+          Stage: v1
 
   APIGatewayUsagePlanKey:
     Type: AWS::ApiGateway::UsagePlanKey
