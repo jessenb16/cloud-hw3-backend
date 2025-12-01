@@ -1,0 +1,314 @@
+Parameters:
+  OS_DOMAIN_NAME:
+    Type: String
+    Description: "OpenSearch domain name"
+
+  OS_ENDPOINT:
+    Type: String
+    Description: "OpenSearch endpoint"
+
+  LEX_BOT_ID:
+    Type: String
+    Description: "Lex bot ID"
+
+  LEX_BOT_ALIAS_ID:
+    Type: String
+    Description: "Lex bot alias ID"
+
+Resources:
+
+  CodeArtifactsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: amzn-s3-code-artifacts-cfn
+
+  # THESE ARE THE DEFINITIONS FOR THE LF1 PIPELINE (LAMBDA, IAM ROLE, PERMISSIONS, S3 BUCKET)
+  IndexPhotos:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: index-photos
+      Runtime: python3.14
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt IndexPhotosIAMRole.Arn
+      Code:
+        S3Bucket: !Ref CodeArtifactsBucket
+        S3Key: index-photos.zip
+      Environment:
+        Variables:
+          OS_ENDPOINT: !Ref OS_ENDPOINT
+      Timeout: 30
+
+  IndexPhotosLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt IndexPhotos.Arn
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !GetAtt ImageBucket.Arn
+
+  IndexPhotosIAMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: IndexPhotosPermissions
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+            #1 Rekognition permission
+              - Effect: Allow
+                Action: rekognition:DetectLabels
+                Resource: "*"
+            #2 Cloudwatch Logs permission
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*:*"
+            #3 Elasticsearch permission
+              - Effect: Allow
+                Action:
+                  - es:ESHttpPut
+                  - es:ESHttpPost
+                Resource: !Sub "arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/${OS_DOMAIN_NAME}/*"
+            #4 S3 permission
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectAcl
+                Resource: !Sub "arn:aws:s3:::${ImageBucket}/*"
+    
+  ImageBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: amzn-s3-b2-photos-cfn
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:Put
+            Function: !GetAtt IndexPhotos.Arn
+
+  # THESE ARE THE DEFINITIONS FOR THE LF2 PIPELINE (LAMBDA, IAM ROLE, PERMISSIONS)
+  SearchPhotos:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: search-photos
+      Runtime: python3.14
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt SearchPhotosIAMRole.Arn
+      Code:
+        S3Bucket: !Ref CodeArtifactsBucket
+        S3Key: search-photos.zip
+      Timeout: 30
+      Environment:
+        Variables:
+          OS_ENDPOINT: !Ref OS_ENDPOINT
+          LEX_BOT_ID: !Ref LEX_BOT_ID
+          LEX_BOT_ALIAS_ID: !Ref LEX_BOT_ALIAS_ID
+
+  SearchPhotosLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt SearchPhotos.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${APIGateway}/*/*"
+
+  SearchPhotosIAMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: SearchPhotosPermissions
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: 
+                  - lex:RecognizeText
+                  - lex:RecognizeUtterance
+                Resource: !Sub "arn:aws:lex:${AWS::Region}:${AWS::AccountId}:bot-alias/${LEX_BOT_ID}/${LEX_BOT_ALIAS_ID}"
+              - Effect: Allow
+                Action:
+                  - es:ESHttpGet
+                  - es:ESHttpPost
+                Resource: !Sub "arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/${OS_DOMAIN_NAME}/*"
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: !Sub "arn:aws:s3:::${ImageBucket}/*"
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*:*"
+
+
+
+
+  # THESE ARE THE DEFINITIONS FOR THE FRONTEND (BUCKETS, API GATEWAY, PERMISSIONS)
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: amzn-s3-b1-frontend-cfn
+      WebsiteConfiguration:
+        IndexDocument: index.html
+
+
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Action: s3:GetObject
+            Effect: Allow
+            Principal: "*"
+            Resource: !Sub "arn:aws:s3:::${FrontendBucket}/*"
+
+  APIGateway:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: AIPhotoSearchAPI
+      Description: API for the AI Photo Search application.
+  
+  APIGatewaySearchResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      ParentId: !GetAtt APIGateway.RootResourceId
+      PathPart: search
+      RestApiId: !Ref APIGateway
+
+  APIGatewaySearchMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref APIGateway
+      ResourceId: !Ref APIGatewaySearchResource
+      HttpMethod: GET
+      AuthorizationType: API_KEY
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${SearchLambdaArn}/invocations
+          - SearchLambdaArn: !GetAtt SearchPhotos.Arn
+      MethodResponses:
+        - StatusCode: 200
+
+  APIGatewayS3Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: APIGatewayS3Permissions
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:PutObjectAcl
+                Resource: !Sub "arn:aws:s3:::${ImageBucket}/*"
+
+  APIGatewayIndexResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      ParentId: !GetAtt APIGateway.RootResourceId
+      PathPart: photos
+      RestApiId: !Ref APIGateway
+
+  APIGatewayIndexMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref APIGateway
+      ResourceId: !Ref APIGatewayIndexResource
+      HttpMethod: PUT
+      AuthorizationType: API_KEY
+      RequestParameters:
+        method.request.querystring.objectKey: true
+        method.request.header.x-amz-meta-customLabels: false
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: PUT
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:s3:path/${ImageBucket}/{objectKey}"
+        Credentials: !GetAtt APIGatewayS3Role.Arn
+        RequestParameters:
+          integration.request.path.objectKey: 'method.request.querystring.objectKey'
+          integration.request.header.x-amz-meta-customLabels: 'method.request.header.x-amz-meta-customLabels'
+        PassthroughBehavior: WHEN_NO_MATCH
+        ContentHandling: CONVERT_TO_BINARY
+        MethodResponses:
+        - StatusCode: '200'
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+
+  APIGatewayDeployment:
+    Type: AWS::ApiGateway::Deployment
+    Properties:
+      RestApiId: !Ref APIGateway
+      Description: Deployment of the API Gateway.
+
+  APIGatewayStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref APIGateway
+      StageName: v1
+      DeploymentId: !Ref APIGatewayDeployment
+      Description: Production stage of the API Gateway.
+
+  APIGatewayAPIKey:
+    Type: AWS::ApiGateway::ApiKey
+    Properties:
+      Name: APIKey
+      Enabled: true
+
+  APIGatewayUsagePlan:
+    Type: AWS::ApiGateway::UsagePlan
+    Properties:
+      UsagePlanName: APIUsagePlan
+      ApiStages:
+        - ApiId: !Ref APIGateway
+          Stage: !Ref APIGatewayStage
+
+  APIGatewayUsagePlanKey:
+    Type: AWS::ApiGateway::UsagePlanKey
+    Properties:
+      KeyId: !Ref APIGatewayAPIKey
+      KeyType: API_KEY
+      UsagePlanId: !Ref APIGatewayUsagePlan
+
+
+Outputs:
+  FrontendURL:
+    Description: The public URL of the photo album frontend.
+    Value: !GetAtt FrontendBucket.WebsiteURL
+
+
+  APIGatewayURL:
+    Description: The public URL of the API Gateway.
+    Value: !Sub 
+      - "https://${ApiId}.execute-api.${AWS::Region}.amazonaws.com/${StageName}"
+      - ApiId: !Ref APIGateway
+        StageName: v1
