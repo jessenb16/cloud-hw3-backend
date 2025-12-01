@@ -1,26 +1,26 @@
 Parameters:
-  OS_DOMAIN_NAME:
+  OSDomainName:
     Type: String
     Description: "OpenSearch domain name"
 
-  OS_ENDPOINT:
+  OSEndPoint:
     Type: String
     Description: "OpenSearch endpoint"
 
-  LEX_BOT_ID:
+  LexBotID:
     Type: String
     Description: "Lex bot ID"
 
-  LEX_BOT_ALIAS_ID:
+  LexBotAliasId:
     Type: String
     Description: "Lex bot alias ID"
 
 Resources:
 
-  CodeArtifactsBucket:
-    Type: AWS::S3::Bucket
-    Properties:
-      BucketName: amzn-s3-code-artifacts-cfn
+  # CodeArtifactsBucket:
+  #   Type: AWS::S3::Bucket
+  #   Properties:
+  #     BucketName: amzn-s3-code-artifacts-cfn
 
   # THESE ARE THE DEFINITIONS FOR THE LF1 PIPELINE (LAMBDA, IAM ROLE, PERMISSIONS, S3 BUCKET)
   IndexPhotos:
@@ -31,11 +31,222 @@ Resources:
       Handler: lambda_function.lambda_handler
       Role: !GetAtt IndexPhotosIAMRole.Arn
       Code:
-        S3Bucket: !Ref CodeArtifactsBucket
-        S3Key: index-photos.zip
+        ZipFile: |
+          import os
+          import json
+          import logging
+          import urllib.parse
+          import urllib3
+          from datetime import datetime, timezone
+          from botocore.session import Session
+          from botocore.awsrequest import AWSRequest
+          from botocore.auth import SigV4Auth
+          import boto3
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          # Environment variables with defaults
+          REKOGNITION_MIN_CONF = float(os.environ.get("REKOGNITION_MIN_CONF", "70.0"))  # percent
+          OS_ENDPOINT = os.environ.get("OS_ENDPOINT", "").rstrip("/")  # e.g. https://search-photos-abc123.us-east-1.es.amazonaws.com
+          OS_INDEX = os.environ.get("OS_INDEX", "photos")
+          REGION = os.environ.get("AWS_REGION", "us-east-1")
+
+          # Validate required environment variables
+          if not OS_ENDPOINT:
+              raise ValueError("OS_ENDPOINT environment variable is required")
+
+          # Initialize AWS clients
+          s3 = boto3.client("s3")
+          rek = boto3.client("rekognition")
+
+          # Initialize HTTP client and credentials for OpenSearch
+          http = urllib3.PoolManager()
+          credentials = Session().get_credentials().get_frozen_credentials()
+
+
+          def os_signed_request(method, path, body=None, params=None):
+              """Send a SigV4-signed HTTP request to OpenSearch."""
+              try:
+                  if params:
+                      qs = urllib.parse.urlencode(params)
+                      url = f"{OS_ENDPOINT}{path}?{qs}"
+                  else:
+                      url = f"{OS_ENDPOINT}{path}"
+
+                  logger.info("OpenSearch request: %s %s", method, url)
+
+                  headers = {
+                      "Host": urllib.parse.urlparse(OS_ENDPOINT).netloc,
+                      "Content-Type": "application/json"
+                  }
+
+                  data = body if isinstance(body, (str, bytes)) else (json.dumps(body) if body else None)
+                  logger.info("Request body: %s", data[:500] if data and len(str(data)) > 500 else data)
+
+                  req = AWSRequest(method=method, url=url, data=data, headers=headers)
+                  SigV4Auth(credentials, "es", REGION).add_auth(req)
+
+                  logger.info("Sending request to OpenSearch...")
+                  resp = http.request(method, url, body=data, headers=dict(req.headers))
+                  logger.info("OpenSearch response status: %s", resp.status)
+                  
+                  if resp.status not in (200, 201):
+                      error_msg = resp.data.decode('utf-8', 'ignore')
+                      logger.error("OpenSearch error response: %s", error_msg)
+                      raise RuntimeError(f"OpenSearch {resp.status}: {error_msg}")
+                  
+                  result = json.loads(resp.data)
+                  logger.info("OpenSearch request successful")
+                  return result
+              except Exception as e:
+                  logger.error("os_signed_request failed: %s", str(e), exc_info=True)
+                  raise
+
+
+          def get_custom_labels(bucket, key):
+              """
+              Retrieve custom labels from S3 object metadata.
+              Returns a list of custom label strings.
+              """
+              try:
+                  head = s3.head_object(Bucket=bucket, Key=key)
+                  meta = head.get("Metadata", {})
+                  # S3 lower-cases metadata keys by default; AWS docs show custom headers as x-amz-meta-...
+                  raw = meta.get("customlabels") or meta.get("customlabels".lower())
+                  if not raw:
+                      return []
+                  # Split on commas and strip
+                  labels = [lbl.strip() for lbl in raw.split(",") if lbl.strip()]
+                  return labels
+              except Exception as e:
+                  logger.warning("Failed to head_object for %s/%s: %s", bucket, key, e)
+                  return []
+
+
+          def get_rekognition_labels(bucket, key, min_conf=REKOGNITION_MIN_CONF):
+              """
+              Use Rekognition to detect labels in the image.
+              Returns a list of label names (strings).
+              """
+              try:
+                  response = rek.detect_labels(
+                      Image={"S3Object": {"Bucket": bucket, "Name": key}},
+                      MaxLabels=50
+                  )
+                  labels = []
+                  for lab in response.get("Labels", []):
+                      if lab.get("Confidence", 0.0) >= min_conf:
+                          labels.append(lab["Name"])
+                  return labels
+              except Exception as e:
+                  logger.error("Rekognition detect_labels failed for %s/%s: %s", bucket, key, e)
+                  return []
+
+
+          def normalize_labels(labels):
+              """
+              Normalize labels: lowercase, strip whitespace, and deduplicate.
+              Preserves order of first occurrence.
+              """
+              normalized = []
+              seen = set()
+              for l in labels:
+                  nl = l.strip().lower()
+                  if nl and nl not in seen:
+                      seen.add(nl)
+                      normalized.append(nl)
+              return normalized
+
+
+          def index_document(doc_id, body):
+              """
+              Index the document in ElasticSearch.
+              """
+              try:
+                  logger.info("Attempting to index document: %s", doc_id)
+                  logger.info("Document body: %s", json.dumps(body))
+                  logger.info("OpenSearch endpoint: %s", OS_ENDPOINT)
+                  logger.info("OpenSearch index: %s", OS_INDEX)
+                  
+                  # URL-encode the doc_id to handle special characters properly
+                  encoded_doc_id = urllib.parse.quote(doc_id, safe='')
+                  path = f"/{OS_INDEX}/_doc/{encoded_doc_id}"
+                  logger.info("Full path: %s", path)
+                  
+                  res = os_signed_request("PUT", path, body=body)
+                  logger.info("Document indexed successfully: %s", doc_id)
+                  logger.info("OpenSearch response: %s", json.dumps(res))
+                  return res
+              except Exception as e:
+                  logger.error("Failed to index document %s: %s", doc_id, str(e), exc_info=True)
+                  raise  # Re-raise so outer handler can catch it
+
+
+          def lambda_handler(event, context):
+              """
+              Lambda function to index photos uploaded to S3.
+              Triggered by S3 PUT events.
+              """
+              logger.info("Received event: %s", json.dumps(event))
+              
+              # Validate environment variables
+              if not OS_ENDPOINT:
+                  logger.error("OS_ENDPOINT environment variable not set")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps('ElasticSearch host not configured')
+                  }
+              
+              # S3 PUT event may contain multiple records; handle each
+              for rec in event.get("Records", []):
+                  try:
+                      s3rec = rec.get("s3", {})
+                      bucket = s3rec["bucket"]["name"]
+                      key = s3rec["object"]["key"]
+                      
+                      # S3 event keys are URL-encoded. Decode to get the actual object key.
+                      # Use unquote_plus to handle both % encoding and + as space.
+                      decoded_key = urllib.parse.unquote_plus(key, encoding='utf-8')
+                      
+                      logger.info("Raw S3 event key: %s", key)
+                      logger.info("Decoded key for S3 operations: %s", decoded_key)
+                      logger.info("Processing s3://%s/%s", bucket, decoded_key)
+                      
+                      # Use decoded_key for all S3 operations
+                      rek_labels = get_rekognition_labels(bucket, decoded_key)
+                      custom_labels = get_custom_labels(bucket, decoded_key)
+                      
+                      # Merge and normalize all labels
+                      merged = normalize_labels(custom_labels + rek_labels)
+                      logger.info("Merged labels: %s", merged)
+                      
+                      # Get timestamp (ISO8601 UTC format)
+                      timestamp = datetime.now(timezone.utc).isoformat(timespec='seconds') + "Z"
+                      
+                      # Create document for ElasticSearch
+                      doc = {
+                          "objectKey": decoded_key,  # Store the decoded key
+                          "bucket": bucket,
+                          "createdTimestamp": timestamp,
+                          "labels": merged
+                      }
+                      
+                      # Use decoded key as doc id (URL-safe). Replace / with _ for valid doc IDs
+                      doc_id = decoded_key.replace("/", "_")
+                      
+                      # Index the document
+                      res = index_document(doc_id, doc)
+                      logger.info("Indexed doc: %s", res)
+                      
+                  except Exception as e:
+                      logger.exception("Error processing record: %s", e)
+                      # Continue processing other records even if one fails
+              
+              return {"status": "ok"}    
       Environment:
         Variables:
-          OS_ENDPOINT: !Ref OS_ENDPOINT
+          OS_ENDPOINT: !Ref OSEndPoint
       Timeout: 30
 
   IndexPhotosLambdaPermission:
@@ -44,8 +255,7 @@ Resources:
       FunctionName: !GetAtt IndexPhotos.Arn
       Action: lambda:InvokeFunction
       Principal: s3.amazonaws.com
-      SourceArn: !GetAtt ImageBucket.Arn
-
+  
   IndexPhotosIAMRole:
     Type: AWS::IAM::Role
     Properties:
@@ -77,16 +287,19 @@ Resources:
                 Action:
                   - es:ESHttpPut
                   - es:ESHttpPost
-                Resource: !Sub "arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/${OS_DOMAIN_NAME}/*"
+                Resource: !Sub "arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/${OSDomainName}/*"
             #4 S3 permission
               - Effect: Allow
                 Action:
                   - s3:GetObject
                   - s3:GetObjectAcl
-                Resource: !Sub "arn:aws:s3:::${ImageBucket}/*"
+                Resource:
+                  - "arn:aws:s3:::*"
+                  - "arn:aws:s3:::*/*"
     
   ImageBucket:
     Type: AWS::S3::Bucket
+    DependsOn: IndexPhotosLambdaPermission
     Properties:
       BucketName: amzn-s3-b2-photos-cfn
       NotificationConfiguration:
@@ -94,7 +307,7 @@ Resources:
           - Event: s3:ObjectCreated:Put
             Function: !GetAtt IndexPhotos.Arn
 
-  # THESE ARE THE DEFINITIONS FOR THE LF2 PIPELINE (LAMBDA, IAM ROLE, PERMISSIONS)
+  # # THESE ARE THE DEFINITIONS FOR THE LF2 PIPELINE (LAMBDA, IAM ROLE, PERMISSIONS)
   SearchPhotos:
     Type: AWS::Lambda::Function
     Properties:
@@ -103,14 +316,233 @@ Resources:
       Handler: lambda_function.lambda_handler
       Role: !GetAtt SearchPhotosIAMRole.Arn
       Code:
-        S3Bucket: !Ref CodeArtifactsBucket
-        S3Key: search-photos.zip
+        ZipFile: |
+          import os
+          import json
+          import logging
+          import urllib.parse
+          import urllib3
+          from botocore.session import Session
+          from botocore.awsrequest import AWSRequest
+          from botocore.auth import SigV4Auth
+          import boto3
+
+          #SUCCESSS IF THIS COMMENT IS HERE 4
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          # Environment variables
+          REGION = os.environ.get("AWS_REGION", "us-east-1")
+          OS_ENDPOINT = os.environ.get("OS_ENDPOINT", "").rstrip("/")
+          OS_INDEX = os.environ.get("OS_INDEX", "photos")
+          LEX_BOT_ID = os.environ.get("LEX_BOT_ID", "")
+          LEX_BOT_ALIAS_ID = os.environ.get("LEX_BOT_ALIAS_ID", "")
+          LEX_LOCALE_ID = os.environ.get("LEX_LOCALE_ID", "en_US")
+
+          # Validate required environment variables
+          if not OS_ENDPOINT:
+              raise ValueError("OS_ENDPOINT environment variable is required")
+          if not LEX_BOT_ID:
+              raise ValueError("LEX_BOT_ID environment variable is required")
+          if not LEX_BOT_ALIAS_ID:
+              raise ValueError("LEX_BOT_ALIAS_ID environment variable is required")
+
+          # AWS clients
+          lex = boto3.client("lexv2-runtime", region_name=REGION)
+          s3 = boto3.client("s3", region_name=REGION) 
+          http = urllib3.PoolManager()
+          credentials = Session().get_credentials().get_frozen_credentials()
+
+
+          def os_signed_request(method, path, body=None, params=None):
+              """Send a SigV4-signed HTTP request to OpenSearch."""
+              if params:
+                  qs = urllib.parse.urlencode(params)
+                  url = f"{OS_ENDPOINT}{path}?{qs}"
+              else:
+                  url = f"{OS_ENDPOINT}{path}"
+
+              headers = {
+                  "Host": urllib.parse.urlparse(OS_ENDPOINT).netloc,
+                  "Content-Type": "application/json"
+              }
+
+              data = body if isinstance(body, (str, bytes)) else (json.dumps(body) if body else None)
+
+              req = AWSRequest(method=method, url=url, data=data, headers=headers)
+              SigV4Auth(credentials, "es", REGION).add_auth(req)
+
+              resp = http.request(method, url, body=data, headers=dict(req.headers))
+              if resp.status not in (200, 201):
+                  raise RuntimeError(f"OpenSearch {resp.status}: {resp.data.decode('utf-8','ignore')}")
+              return json.loads(resp.data)
+
+
+          def query_lex(query_text, session_id="default-session"):
+              """Send user query to Lex V2 and extract slot values."""
+              try:
+                  resp = lex.recognize_text(
+                      botId=LEX_BOT_ID,
+                      botAliasId=LEX_BOT_ALIAS_ID,
+                      localeId=LEX_LOCALE_ID,
+                      sessionId=session_id,
+                      text=query_text
+                  )
+                  
+                  logger.info("Lex response: %s", json.dumps(resp))
+                  
+                  # Extract slots that contain keywords
+                  interpretations = resp.get("interpretations", [])
+                  if not interpretations:
+                      logger.warning("No interpretations from Lex")
+                      return []
+                  
+                  intent = interpretations[0].get("intent", {})
+                  slots = intent.get("slots", {})
+                  
+                  keywords = []
+                  for slot_name, slot_data in slots.items():
+                      if not slot_data:
+                          continue
+                          
+                      # Try different ways to extract the value
+                      value = None
+                      if isinstance(slot_data, dict):
+                          # Check for interpretedValue (Lex V2 format)
+                          if "value" in slot_data and isinstance(slot_data["value"], dict):
+                              value = slot_data["value"].get("interpretedValue")
+                          # Fallback to direct value
+                          if not value:
+                              value = slot_data.get("value")
+                          # Fallback to originalValue
+                          if not value:
+                              value = slot_data.get("originalValue")
+                      
+                      if value:
+                          # Handle both string and dict values
+                          if isinstance(value, dict):
+                              value = value.get("interpretedValue") or value.get("originalValue")
+                          if value:
+                              keywords.append(str(value))
+                  
+                  keywords = [k.lower().strip() for k in keywords if k]
+                  logger.info("Extracted keywords: %s", keywords)
+                  return keywords
+                  
+              except Exception as e:
+                  logger.error("Lex query failed: %s", e, exc_info=True)
+                  return []
+
+
+          def search_photos_in_os(keywords, size=20):
+              """Search OpenSearch for photos matching keywords in 'labels' field."""
+              if not keywords:
+                  return []
+
+              query = {
+                  "size": size,
+                  "query": {
+                      "bool": {
+                          "should": [{"match": {"labels": kw}} for kw in keywords],
+                          "minimum_should_match": 1
+                      }
+                  }
+              }
+              
+              try:
+                  res = os_signed_request("POST", f"/{OS_INDEX}/_search", body=query)
+                  hits = res.get("hits", {}).get("hits", [])
+                  results = []
+                  for h in hits:
+                      source = h["_source"]
+                      bucket = source["bucket"]
+                      object_key = source["objectKey"]
+                      labels = source.get("labels", [])  # Extract labels
+                      
+                      # Generate presigned URL (or use public URL if bucket is public)
+                      photo_url = s3.generate_presigned_url(
+                          'get_object',
+                          Params={'Bucket': bucket, 'Key': object_key},
+                          ExpiresIn=3600
+                      )
+                      
+                      results.append({
+                          "url": photo_url,
+                          "labels": labels
+                      })
+                  
+                  logger.info("OpenSearch returned %d hits", len(results))
+                  return results
+              except Exception as e:
+                  logger.error("OpenSearch search failed: %s", e, exc_info=True)
+                  return []
+
+          def lambda_handler(event, context):
+              """Lambda handler for /search?q=<query> requests."""
+              try:
+                  logger.info("Received event: %s", json.dumps(event))
+
+                  # Extract query string from API Gateway
+                  query_params = event.get("queryStringParameters") or {}
+                  query_text = query_params.get("q", "").strip()
+                  
+                  if not query_text:
+                      logger.info("Empty query, returning empty results")
+                      return {
+                          "statusCode": 200,
+                          "headers": {
+                              "Content-Type": "application/json",
+                              "Access-Control-Allow-Origin": "*"  # Add CORS if needed
+                          },
+                          "body": json.dumps([])
+                      }
+
+                  # Disambiguate query using Lex
+                  keywords = query_lex(query_text)
+                  logger.info("Query '%s' disambiguated to keywords: %s", query_text, keywords)
+
+                  # If no keywords found, return empty results
+                  if not keywords:
+                      logger.info("No keywords extracted, returning empty results")
+                      return {
+                          "statusCode": 200,
+                          "headers": {
+                              "Content-Type": "application/json",
+                              "Access-Control-Allow-Origin": "*"
+                          },
+                          "body": json.dumps([])
+                      }
+
+                  # Search OpenSearch
+                  results = search_photos_in_os(keywords)
+                  logger.info("Found %d results for keywords: %s", len(results), keywords)
+
+                  return {
+                      "statusCode": 200,
+                      "headers": {
+                          "Content-Type": "application/json",
+                          "Access-Control-Allow-Origin": "*"
+                      },
+                      "body": json.dumps({"results": results})  # Wrap in "results" object
+                  }
+                  
+              except Exception as e:
+                  logger.error("Error in lambda_handler: %s", e, exc_info=True)
+                  return {
+                      "statusCode": 500,
+                      "headers": {
+                          "Content-Type": "application/json",
+                          "Access-Control-Allow-Origin": "*"
+                      },
+                      "body": json.dumps({"results": []})
+                  }
       Timeout: 30
       Environment:
         Variables:
-          OS_ENDPOINT: !Ref OS_ENDPOINT
-          LEX_BOT_ID: !Ref LEX_BOT_ID
-          LEX_BOT_ALIAS_ID: !Ref LEX_BOT_ALIAS_ID
+          OS_ENDPOINT: !Ref OSEndPoint
+          LEX_BOT_ID: !Ref LexBotID
+          LEX_BOT_ALIAS_ID: !Ref LexBotAliasId
 
   SearchPhotosLambdaPermission:
     Type: AWS::Lambda::Permission
@@ -118,7 +550,7 @@ Resources:
       FunctionName: !GetAtt SearchPhotos.Arn
       Action: lambda:InvokeFunction
       Principal: apigateway.amazonaws.com
-      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${APIGateway}/*/*"
+      # SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${APIGateway}/*/*"
 
   SearchPhotosIAMRole:
     Type: AWS::IAM::Role
@@ -139,12 +571,12 @@ Resources:
                 Action: 
                   - lex:RecognizeText
                   - lex:RecognizeUtterance
-                Resource: !Sub "arn:aws:lex:${AWS::Region}:${AWS::AccountId}:bot-alias/${LEX_BOT_ID}/${LEX_BOT_ALIAS_ID}"
+                Resource: !Sub "arn:aws:lex:${AWS::Region}:${AWS::AccountId}:bot-alias/${LexBotID}/${LexBotAliasId}"
               - Effect: Allow
                 Action:
                   - es:ESHttpGet
                   - es:ESHttpPost
-                Resource: !Sub "arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/${OS_DOMAIN_NAME}/*"
+                Resource: !Sub "arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/${OSDomainName}/*"
               - Effect: Allow
                 Action:
                   - s3:GetObject
@@ -159,7 +591,7 @@ Resources:
 
 
 
-  # THESE ARE THE DEFINITIONS FOR THE FRONTEND (BUCKETS, API GATEWAY, PERMISSIONS)
+  # # THESE ARE THE DEFINITIONS FOR THE FRONTEND (BUCKETS, API GATEWAY, PERMISSIONS)
   FrontendBucket:
     Type: AWS::S3::Bucket
     Properties:
@@ -180,124 +612,124 @@ Resources:
             Principal: "*"
             Resource: !Sub "arn:aws:s3:::${FrontendBucket}/*"
 
-  APIGateway:
-    Type: AWS::ApiGateway::RestApi
-    Properties:
-      Name: AIPhotoSearchAPI
-      Description: API for the AI Photo Search application.
+  # APIGateway:
+  #   Type: AWS::ApiGateway::RestApi
+  #   Properties:
+  #     Name: AIPhotoSearchAPI
+  #     Description: API for the AI Photo Search application.
   
-  APIGatewaySearchResource:
-    Type: AWS::ApiGateway::Resource
-    Properties:
-      ParentId: !GetAtt APIGateway.RootResourceId
-      PathPart: search
-      RestApiId: !Ref APIGateway
+  # APIGatewaySearchResource:
+  #   Type: AWS::ApiGateway::Resource
+  #   Properties:
+  #     ParentId: !GetAtt APIGateway.RootResourceId
+  #     PathPart: search
+  #     RestApiId: !Ref APIGateway
 
-  APIGatewaySearchMethod:
-    Type: AWS::ApiGateway::Method
-    Properties:
-      RestApiId: !Ref APIGateway
-      ResourceId: !Ref APIGatewaySearchResource
-      HttpMethod: GET
-      AuthorizationType: API_KEY
-      Integration:
-        Type: AWS_PROXY
-        IntegrationHttpMethod: POST
-        Uri: !Sub
-          - arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${SearchLambdaArn}/invocations
-          - SearchLambdaArn: !GetAtt SearchPhotos.Arn
-      MethodResponses:
-        - StatusCode: 200
+  # APIGatewaySearchMethod:
+  #   Type: AWS::ApiGateway::Method
+  #   Properties:
+  #     RestApiId: !Ref APIGateway
+  #     ResourceId: !Ref APIGatewaySearchResource
+  #     HttpMethod: GET
+  #     AuthorizationType: API_KEY
+  #     Integration:
+  #       Type: AWS_PROXY
+  #       IntegrationHttpMethod: POST
+  #       Uri: !Sub
+  #         - arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${SearchLambdaArn}/invocations
+  #         - SearchLambdaArn: !GetAtt SearchPhotos.Arn
+  #     MethodResponses:
+  #       - StatusCode: 200
 
-  APIGatewayS3Role:
-    Type: AWS::IAM::Role
-    Properties:
-      AssumeRolePolicyDocument:
-        Version: 2012-10-17
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service: apigateway.amazonaws.com
-            Action: sts:AssumeRole
-      Policies:
-        - PolicyName: APIGatewayS3Permissions
-          PolicyDocument:
-            Version: 2012-10-17
-            Statement:
-              - Effect: Allow
-                Action:
-                  - s3:PutObject
-                  - s3:PutObjectAcl
-                Resource: !Sub "arn:aws:s3:::${ImageBucket}/*"
+  # APIGatewayS3Role:
+  #   Type: AWS::IAM::Role
+  #   Properties:
+  #     AssumeRolePolicyDocument:
+  #       Version: 2012-10-17
+  #       Statement:
+  #         - Effect: Allow
+  #           Principal:
+  #             Service: apigateway.amazonaws.com
+  #           Action: sts:AssumeRole
+  #     Policies:
+  #       - PolicyName: APIGatewayS3Permissions
+  #         PolicyDocument:
+  #           Version: 2012-10-17
+  #           Statement:
+  #             - Effect: Allow
+  #               Action:
+  #                 - s3:PutObject
+  #                 - s3:PutObjectAcl
+  #               Resource: !Sub "arn:aws:s3:::${ImageBucket}/*"
 
-  APIGatewayIndexResource:
-    Type: AWS::ApiGateway::Resource
-    Properties:
-      ParentId: !GetAtt APIGateway.RootResourceId
-      PathPart: photos
-      RestApiId: !Ref APIGateway
+  # APIGatewayIndexResource:
+  #   Type: AWS::ApiGateway::Resource
+  #   Properties:
+  #     ParentId: !GetAtt APIGateway.RootResourceId
+  #     PathPart: photos
+  #     RestApiId: !Ref APIGateway
 
-  APIGatewayIndexMethod:
-    Type: AWS::ApiGateway::Method
-    Properties:
-      RestApiId: !Ref APIGateway
-      ResourceId: !Ref APIGatewayIndexResource
-      HttpMethod: PUT
-      AuthorizationType: API_KEY
-      RequestParameters:
-        method.request.querystring.objectKey: true
-        method.request.header.x-amz-meta-customLabels: false
-      Integration:
-        Type: AWS
-        IntegrationHttpMethod: PUT
-        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:s3:path/${ImageBucket}/{objectKey}"
-        Credentials: !GetAtt APIGatewayS3Role.Arn
-        RequestParameters:
-          integration.request.path.objectKey: 'method.request.querystring.objectKey'
-          integration.request.header.x-amz-meta-customLabels: 'method.request.header.x-amz-meta-customLabels'
-        PassthroughBehavior: WHEN_NO_MATCH
-        ContentHandling: CONVERT_TO_BINARY
-        MethodResponses:
-        - StatusCode: '200'
-          ResponseParameters:
-            method.response.header.Access-Control-Allow-Origin: true
-            method.response.header.Access-Control-Allow-Headers: true
-            method.response.header.Access-Control-Allow-Methods: true
+  # APIGatewayIndexMethod:
+  #   Type: AWS::ApiGateway::Method
+  #   Properties:
+  #     RestApiId: !Ref APIGateway
+  #     ResourceId: !Ref APIGatewayIndexResource
+  #     HttpMethod: PUT
+  #     AuthorizationType: API_KEY
+  #     RequestParameters:
+  #       method.request.querystring.objectKey: true
+  #       method.request.header.x-amz-meta-customLabels: false
+  #     Integration:
+  #       Type: AWS
+  #       IntegrationHttpMethod: PUT
+  #       Uri: !Sub "arn:aws:apigateway:${AWS::Region}:s3:path/${ImageBucket}/{objectKey}"
+  #       Credentials: !GetAtt APIGatewayS3Role.Arn
+  #       RequestParameters:
+  #         integration.request.path.objectKey: 'method.request.querystring.objectKey'
+  #         integration.request.header.x-amz-meta-customLabels: 'method.request.header.x-amz-meta-customLabels'
+  #       PassthroughBehavior: WHEN_NO_MATCH
+  #       ContentHandling: CONVERT_TO_BINARY
+  #       MethodResponses:
+  #       - StatusCode: '200'
+  #         ResponseParameters:
+  #           method.response.header.Access-Control-Allow-Origin: true
+  #           method.response.header.Access-Control-Allow-Headers: true
+  #           method.response.header.Access-Control-Allow-Methods: true
 
-  APIGatewayDeployment:
-    Type: AWS::ApiGateway::Deployment
-    Properties:
-      RestApiId: !Ref APIGateway
-      Description: Deployment of the API Gateway.
+  # APIGatewayDeployment:
+  #   Type: AWS::ApiGateway::Deployment
+  #   Properties:
+  #     RestApiId: !Ref APIGateway
+  #     Description: Deployment of the API Gateway.
 
-  APIGatewayStage:
-    Type: AWS::ApiGateway::Stage
-    Properties:
-      RestApiId: !Ref APIGateway
-      StageName: v1
-      DeploymentId: !Ref APIGatewayDeployment
-      Description: Production stage of the API Gateway.
+  # APIGatewayStage:
+  #   Type: AWS::ApiGateway::Stage
+  #   Properties:
+  #     RestApiId: !Ref APIGateway
+  #     StageName: v1
+  #     DeploymentId: !Ref APIGatewayDeployment
+  #     Description: Production stage of the API Gateway.
 
-  APIGatewayAPIKey:
-    Type: AWS::ApiGateway::ApiKey
-    Properties:
-      Name: APIKey
-      Enabled: true
+  # APIGatewayAPIKey:
+  #   Type: AWS::ApiGateway::ApiKey
+  #   Properties:
+  #     Name: APIKey
+  #     Enabled: true
 
-  APIGatewayUsagePlan:
-    Type: AWS::ApiGateway::UsagePlan
-    Properties:
-      UsagePlanName: APIUsagePlan
-      ApiStages:
-        - ApiId: !Ref APIGateway
-          Stage: !Ref APIGatewayStage
+  # APIGatewayUsagePlan:
+  #   Type: AWS::ApiGateway::UsagePlan
+  #   Properties:
+  #     UsagePlanName: APIUsagePlan
+  #     ApiStages:
+  #       - ApiId: !Ref APIGateway
+  #         Stage: !Ref APIGatewayStage
 
-  APIGatewayUsagePlanKey:
-    Type: AWS::ApiGateway::UsagePlanKey
-    Properties:
-      KeyId: !Ref APIGatewayAPIKey
-      KeyType: API_KEY
-      UsagePlanId: !Ref APIGatewayUsagePlan
+  # APIGatewayUsagePlanKey:
+  #   Type: AWS::ApiGateway::UsagePlanKey
+  #   Properties:
+  #     KeyId: !Ref APIGatewayAPIKey
+  #     KeyType: API_KEY
+  #     UsagePlanId: !Ref APIGatewayUsagePlan
 
 
 Outputs:
@@ -306,9 +738,9 @@ Outputs:
     Value: !GetAtt FrontendBucket.WebsiteURL
 
 
-  APIGatewayURL:
-    Description: The public URL of the API Gateway.
-    Value: !Sub 
-      - "https://${ApiId}.execute-api.${AWS::Region}.amazonaws.com/${StageName}"
-      - ApiId: !Ref APIGateway
-        StageName: v1
+#   APIGatewayURL:
+#     Description: The public URL of the API Gateway.
+#     Value: !Sub 
+#       - "https://${ApiId}.execute-api.${AWS::Region}.amazonaws.com/${StageName}"
+#       - ApiId: !Ref APIGateway
+#         StageName: v1
