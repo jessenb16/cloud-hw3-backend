@@ -1,3 +1,6 @@
+
+
+
 Parameters:
   OSDomainName:
     Type: String
@@ -250,7 +253,7 @@ Resources:
       FunctionName: !GetAtt IndexPhotos.Arn
       Action: lambda:InvokeFunction
       Principal: s3.amazonaws.com
-  
+
   IndexPhotosIAMRole:
     Type: AWS::IAM::Role
     Properties:
@@ -583,6 +586,45 @@ Resources:
                   - logs:PutLogEvents
                 Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*:*"
 
+  # CloudWatch Log Groups
+  IndexPhotosLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: "/aws/lambda/index-photos"
+      RetentionInDays: 7
+
+  SearchPhotosLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: "/aws/lambda/search-photos"
+      RetentionInDays: 7
+
+  APIGatewayLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/apigateway/${APIGateway}"
+      RetentionInDays: 7
+
+  # IAM Role for API Gateway to write logs
+  APIGatewayCloudWatchRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs
+
+  # API Gateway Account-level CloudWatch Log Role
+  APIGatewayAccount:
+    Type: AWS::ApiGateway::Account
+    Properties:
+      CloudWatchRoleArn: !GetAtt APIGatewayCloudWatchRole.Arn
+
   # THESE ARE THE DEFINITIONS FOR THE FRONTEND (BUCKETS, API GATEWAY, PERMISSIONS)
   FrontendBucket:
     Type: AWS::S3::Bucket
@@ -648,6 +690,30 @@ Resources:
         Uri: !Sub
           - arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${SearchLambdaArn}/invocations
           - SearchLambdaArn: !GetAtt SearchPhotos.Arn
+
+  APIGatewaySearchOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref APIGateway
+      ResourceId: !Ref APIGatewaySearchResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: '200'
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token,x-api-key'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,OPTIONS'"
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: '200'
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
 
   APIGatewayS3Role:
     Type: AWS::IAM::Role
@@ -729,22 +795,62 @@ Resources:
               method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token,x-api-key,x-amz-meta-customLabels'"
               method.response.header.Access-Control-Allow-Methods: "'PUT,OPTIONS'"
 
+  APIGatewayIndexOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref APIGateway
+      ResourceId: !Ref APIGatewayIndexResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: '200'
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token,x-api-key,x-amz-meta-customlabels'"
+              method.response.header.Access-Control-Allow-Methods: "'PUT,OPTIONS'"
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: '200'
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+
   APIGatewayDeployment:
     Type: AWS::ApiGateway::Deployment
     DependsOn:
       - APIGatewaySearchMethod
+      - APIGatewaySearchOptionsMethod
       - APIGatewayIndexMethod
+      - APIGatewayIndexOptionsMethod
     Properties:
       RestApiId: !Ref APIGateway
       Description: Deployment of the API Gateway.
 
   APIGatewayStage:
     Type: AWS::ApiGateway::Stage
+    DependsOn:
+      - APIGatewayCloudWatchRole
+      - APIGatewayLogGroup
+      - APIGatewayAccount
     Properties:
       RestApiId: !Ref APIGateway
       StageName: v1
       DeploymentId: !Ref APIGatewayDeployment
       Description: Production stage of the API Gateway.
+      AccessLogSetting:
+        DestinationArn: !GetAtt APIGatewayLogGroup.Arn
+        Format: '{"requestId":"$context.requestId","ip":"$context.identity.sourceIp","caller":"$context.identity.caller","user":"$context.identity.user","requestTime":"$context.requestTime","httpMethod":"$context.httpMethod","resourcePath":"$context.resourcePath","status":"$context.status","protocol":"$context.protocol","responseLength":"$context.responseLength"}'
+      MethodSettings:
+        - ResourcePath: "/*"
+          HttpMethod: "*"
+          LoggingLevel: INFO
+          DataTraceEnabled: true
+          MetricsEnabled: true
+      TracingEnabled: true
 
   APIGatewayAPIKey:
     Type: AWS::ApiGateway::ApiKey
